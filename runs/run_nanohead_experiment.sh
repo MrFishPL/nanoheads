@@ -11,12 +11,14 @@
 #   --nanohead-dim N            Nanohead dimension (default: 3)
 #   --proportions "..."         Comma-separated proportions (default: "0.0,0.2,0.4,0.6,0.8")
 #   --target-param-data-ratio N Data:param ratio for training duration (default: 10.5, Chinchilla=20)
+#   --device-batch-size N       Per-device batch size (default: 32, reduce if OOM)
 #
 # Examples:
 #   bash runs/run_nanohead_experiment.sh --target-params 100
 #   bash runs/run_nanohead_experiment.sh --target-params 500
 #   bash runs/run_nanohead_experiment.sh --proportions "0.0,0.3,0.5"
 #   bash runs/run_nanohead_experiment.sh --target-params 500 --target-param-data-ratio 20
+#   bash runs/run_nanohead_experiment.sh --target-params 500 --device-batch-size 16
 
 set -e  # Exit on error
 

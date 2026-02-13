@@ -45,6 +45,21 @@ bash runs/run_nanohead_experiment.sh --proportions "0.0,0.1,0.2,0.3,0.4,0.5,0.6,
 bash runs/run_nanohead_experiment.sh --proportions "0.0,0.5,1.0"
 ```
 
+### Change Batch Size
+
+If you encounter out-of-memory (OOM) errors, reduce the batch size:
+
+```bash
+# Reduce batch size for smaller GPUs (e.g., 24GB VRAM)
+bash runs/run_nanohead_experiment.sh --device-batch-size 16
+
+# Further reduce for even smaller GPUs
+bash runs/run_nanohead_experiment.sh --device-batch-size 8
+
+# Large batch for high-memory GPUs (A100/H100)
+bash runs/run_nanohead_experiment.sh --device-batch-size 64
+```
+
 ### Change Training Duration (via Data-to-Parameter Ratio)
 
 Training duration is automatically calculated based on model size and the data-to-parameter ratio (Chinchilla scaling laws).
@@ -81,7 +96,17 @@ bash runs/run_nanohead_experiment.sh \
     --target-params 500 \
     --nanohead-dim 3 \
     --proportions "0.0,0.2,0.4,0.6,0.8" \
-    --target-param-data-ratio 20
+    --target-param-data-ratio 20 \
+    --device-batch-size 16
+```
+
+### Quick test on smaller GPU (reduce batch size)
+```bash
+bash runs/run_nanohead_experiment.sh \
+    --target-params 50 \
+    --proportions "0.0,0.2" \
+    --device-batch-size 8 \
+    --target-param-data-ratio 5
 ```
 
 ### Test different nanohead dimensions
@@ -132,6 +157,7 @@ python runs/nanohead_experiment.py --help
 | `--nanohead-dim` | 3 | Dimension of each nanohead (2, 3, 4, etc.) |
 | `--proportions` | 0.0,0.2,0.4,0.6,0.8 | Comma-separated list of proportions to test |
 | `--target-param-data-ratio` | 10.5 | Data-to-parameter ratio (Chinchilla=20, higher=longer training) |
+| `--device-batch-size` | 32 | Per-device batch size (reduce to 16/8/4 if OOM) |
 
 ## Output
 

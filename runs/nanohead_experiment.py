@@ -81,7 +81,7 @@ def estimate_depth_for_target_params(target_params, aspect_ratio=64, vocab_size=
     return best_depth, final_params
 
 
-def run_training(depth, nanohead_proportion, nanohead_dim, wandb_run_name, target_param_data_ratio=10.5):
+def run_training(depth, nanohead_proportion, nanohead_dim, wandb_run_name, target_param_data_ratio=10.5, device_batch_size=32):
     """
     Run a single training run with the specified configuration.
     Uses Chinchilla-optimal training duration based on target_param_data_ratio.
@@ -100,6 +100,7 @@ def run_training(depth, nanohead_proportion, nanohead_dim, wandb_run_name, targe
         "--nanohead-dim", str(nanohead_dim),
         "--run", wandb_run_name,
         "--target-param-data-ratio", str(target_param_data_ratio),  # Chinchilla-style compute-optimal
+        "--device-batch-size", str(device_batch_size),  # Per-device batch size
         "--eval-every", "250",  # Default eval frequency
         "--core-metric-every", "-1",  # Disable CORE metric for speed
         "--sample-every", "-1",  # Disable sampling
@@ -206,6 +207,8 @@ def main():
                         help="Comma-separated list of nanohead proportions to test (default: 0.0,0.2,0.4,0.6,0.8)")
     parser.add_argument("--target-param-data-ratio", type=float, default=10.5,
                         help="Data-to-parameter ratio for compute-optimal training (Chinchilla=20, default: 10.5)")
+    parser.add_argument("--device-batch-size", type=int, default=32,
+                        help="Per-device batch size (default: 32, reduce if OOM)")
     args = parser.parse_args()
 
     # Configuration
@@ -213,6 +216,7 @@ def main():
     nanohead_dim = args.nanohead_dim
     proportions = [float(p.strip()) for p in args.proportions.split(',')]
     target_param_data_ratio = args.target_param_data_ratio
+    device_batch_size = args.device_batch_size
 
     # Estimate depth for the baseline (no nanoheads)
     depth, actual_params = estimate_depth_for_target_params(
@@ -259,7 +263,8 @@ def main():
             nanohead_proportion=proportion,
             nanohead_dim=nanohead_dim,
             wandb_run_name=run_name,
-            target_param_data_ratio=target_param_data_ratio
+            target_param_data_ratio=target_param_data_ratio,
+            device_batch_size=device_batch_size
         )
 
     print0("\n" + "="*80)
