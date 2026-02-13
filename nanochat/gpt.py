@@ -37,6 +37,9 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Nanohead configuration
+    nanohead_proportion: float = 0.0  # proportion of attention QKV params for nanoheads (0 = disabled)
+    nanohead_dim: int = 3  # dimension of each nanohead
 
 
 def norm(x):
@@ -56,64 +59,191 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
 
+def calculate_nanohead_split(n_embd, n_head, n_kv_head, head_dim, nanohead_proportion, nanohead_dim):
+    """
+    Calculate split between normal and nano heads based on QKV parameter proportion.
+
+    Returns: (normal_heads, normal_kv_heads, normal_head_dim,
+              nano_heads, nano_kv_heads, nano_head_dim)
+    """
+    if nanohead_proportion == 0:
+        return n_head, n_kv_head, head_dim, 0, 0, nanohead_dim
+
+    # GQA ratio (how many query heads per KV head)
+    gqa_ratio = n_head / n_kv_head
+
+    # We want: nano_qkv_params / total_qkv_params ≈ nanohead_proportion
+    # Start with approximate split based on output dimensions
+    target_nano_dim = round(nanohead_proportion * n_embd / nanohead_dim) * nanohead_dim
+    target_nano_dim = max(nanohead_dim, target_nano_dim)  # At least one nanohead
+    target_nano_dim = min(target_nano_dim, n_embd - 2)  # Leave at least dim 2 for normal heads
+
+    # Try to find a valid split where:
+    # 1. normal_head_dim is even (for RoPE)
+    # 2. total dimensions sum to exactly n_embd
+    # 3. nano_output_dim is a multiple of nanohead_dim
+
+    best_config = None
+    best_diff = float('inf')
+
+    # Try different nano_output_dims around the target
+    # nano_dim must be a multiple of nanohead_dim
+    # normal_dim must be even (so it can have even head_dim)
+    # nano_dim + normal_dim must equal n_embd
+
+    # This means we need: nano_dim = k * nanohead_dim for some integer k
+    # and normal_dim = n_embd - k * nanohead_dim must be even
+
+    # If nanohead_dim is odd and n_embd is even, then k * nanohead_dim must be even
+    # which means k must be even (since odd * odd = odd)
+    step = nanohead_dim if nanohead_dim % 2 == 0 else 2 * nanohead_dim
+
+    for nano_dim_candidate in range(step, n_embd - 1, step):
+        normal_dim_candidate = n_embd - nano_dim_candidate
+
+        # Verify normal_dim is even
+        if normal_dim_candidate % 2 != 0:
+            continue
+
+        # Verify nano_dim is a multiple of nanohead_dim
+        if nano_dim_candidate % nanohead_dim != 0:
+            continue
+
+        # Find best even divisor for normal_dim_candidate (closest to target head_dim)
+        for candidate_head_dim in range(2, normal_dim_candidate + 1, 2):
+            if normal_dim_candidate % candidate_head_dim == 0:
+                diff = abs(nano_dim_candidate - target_nano_dim)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_config = (normal_dim_candidate, candidate_head_dim, nano_dim_candidate)
+                break  # Take the first (smallest) even divisor
+
+    assert best_config is not None, f"Could not find valid split for n_embd={n_embd}, proportion={nanohead_proportion}"
+
+    normal_output_dim, normal_head_dim, nano_output_dim = best_config
+
+    # Calculate number of heads
+    normal_heads = normal_output_dim // normal_head_dim
+    normal_kv_heads = max(1, round(normal_heads / gqa_ratio))
+    nano_heads = nano_output_dim // nanohead_dim
+    nano_kv_heads = max(1, round(nano_heads / gqa_ratio))
+
+    # Verify the split
+    actual_total = normal_heads * normal_head_dim + nano_heads * nanohead_dim
+    assert actual_total == n_embd, \
+        f"Output dimension mismatch: {normal_heads}*{normal_head_dim} + {nano_heads}*{nanohead_dim} = {actual_total} != {n_embd}"
+    assert normal_head_dim % 2 == 0, f"Normal head dimension must be even for RoPE, got {normal_head_dim}"
+
+    return normal_heads, normal_kv_heads, normal_head_dim, nano_heads, nano_kv_heads, nanohead_dim
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.layer_idx = layer_idx
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
-        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.config = config
+
+        # Calculate split between normal and nano heads
+        default_head_dim = config.n_embd // config.n_head
+        (self.normal_heads, self.normal_kv_heads, self.normal_head_dim,
+         self.nano_heads, self.nano_kv_heads, self.nano_head_dim) = calculate_nanohead_split(
+            config.n_embd, config.n_head, config.n_kv_head, default_head_dim,
+            config.nanohead_proportion, config.nanohead_dim
+        )
+
+        self.has_nanoheads = self.nano_heads > 0
+
+        # Normal head projections
+        if self.normal_heads > 0:
+            self.c_q_normal = nn.Linear(self.n_embd, self.normal_heads * self.normal_head_dim, bias=False)
+            self.c_k_normal = nn.Linear(self.n_embd, self.normal_kv_heads * self.normal_head_dim, bias=False)
+            self.c_v_normal = nn.Linear(self.n_embd, self.normal_kv_heads * self.normal_head_dim, bias=False)
+
+        # Nano head projections (no RoPE, so different handling)
+        if self.has_nanoheads:
+            self.c_q_nano = nn.Linear(self.n_embd, self.nano_heads * self.nano_head_dim, bias=False)
+            self.c_k_nano = nn.Linear(self.n_embd, self.nano_kv_heads * self.nano_head_dim, bias=False)
+            self.c_v_nano = nn.Linear(self.n_embd, self.nano_kv_heads * self.nano_head_dim, bias=False)
+
+        # Output projection (same for all heads)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+
+        # Value embeddings
         self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        total_kv_heads = self.normal_kv_heads + self.nano_kv_heads
+        self.ve_gate = nn.Linear(self.ve_gate_channels, total_kv_heads, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
 
-        # Project the input to get queries, keys, and values
-        # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        outputs = []
 
-        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
-        if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 2)
-            v = v + gate.unsqueeze(-1) * ve
+        # Process normal heads (with RoPE)
+        if self.normal_heads > 0:
+            q_normal = self.c_q_normal(x).view(B, T, self.normal_heads, self.normal_head_dim)
+            k_normal = self.c_k_normal(x).view(B, T, self.normal_kv_heads, self.normal_head_dim)
+            v_normal = self.c_v_normal(x).view(B, T, self.normal_kv_heads, self.normal_head_dim)
 
-        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k) # QK norm
+            # Value residual for normal heads
+            if ve is not None:
+                ve_normal_dim = self.normal_kv_heads * self.normal_head_dim
+                ve_normal = ve[..., :ve_normal_dim].view(B, T, self.normal_kv_heads, self.normal_head_dim)
+                gate_normal = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels])[..., :self.normal_kv_heads])
+                v_normal = v_normal + gate_normal.unsqueeze(-1) * ve_normal
 
-        # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
-        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        else:
-            # Inference: use flash_attn_with_kvcache which handles cache management
-            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
-                q, k_cache, v_cache,
-                k=k, v=v,
-                cache_seqlens=kv_cache.cache_seqlens,
-                causal=True,
-                window_size=window_size,
-            )
-            # Advance position after last layer processes
-            if self.layer_idx == kv_cache.n_layers - 1:
-                kv_cache.advance(T)
+            # Apply RoPE to normal heads
+            cos, sin = cos_sin
+            q_normal = apply_rotary_emb(q_normal, cos, sin)
+            k_normal = apply_rotary_emb(k_normal, cos, sin)
+            q_normal, k_normal = norm(q_normal), norm(k_normal)
 
-        # Re-assemble the heads and project back to residual stream
-        y = y.contiguous().view(B, T, -1)
+            # Flash attention for normal heads
+            if kv_cache is None:
+                y_normal = flash_attn.flash_attn_func(q_normal, k_normal, v_normal, causal=True, window_size=window_size)
+            else:
+                # TODO: Handle KV cache for split heads
+                k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+                y_normal = flash_attn.flash_attn_with_kvcache(
+                    q_normal, k_cache, v_cache,
+                    k=k_normal, v=v_normal,
+                    cache_seqlens=kv_cache.cache_seqlens,
+                    causal=True,
+                    window_size=window_size,
+                )
+                if self.layer_idx == kv_cache.n_layers - 1:
+                    kv_cache.advance(T)
+
+            outputs.append(y_normal.contiguous().view(B, T, -1))
+
+        # Process nano heads (no RoPE!)
+        if self.has_nanoheads:
+            q_nano = self.c_q_nano(x).view(B, T, self.nano_heads, self.nano_head_dim)
+            k_nano = self.c_k_nano(x).view(B, T, self.nano_kv_heads, self.nano_head_dim)
+            v_nano = self.c_v_nano(x).view(B, T, self.nano_kv_heads, self.nano_head_dim)
+
+            # Value residual for nano heads
+            if ve is not None:
+                ve_nano_start = self.normal_kv_heads * self.normal_head_dim
+                ve_nano_dim = self.nano_kv_heads * self.nano_head_dim
+                ve_nano = ve[..., ve_nano_start:ve_nano_start + ve_nano_dim].view(B, T, self.nano_kv_heads, self.nano_head_dim)
+                gate_nano = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels])[..., self.normal_kv_heads:])
+                v_nano = v_nano + gate_nano.unsqueeze(-1) * ve_nano
+
+            # NO RoPE for nano heads, just QK norm
+            q_nano, k_nano = norm(q_nano), norm(k_nano)
+
+            # Flash attention for nano heads
+            if kv_cache is None:
+                y_nano = flash_attn.flash_attn_func(q_nano, k_nano, v_nano, causal=True, window_size=window_size)
+            else:
+                # TODO: Handle KV cache for nano heads properly
+                # For now, simplified version
+                y_nano = flash_attn.flash_attn_func(q_nano, k_nano, v_nano, causal=True, window_size=window_size)
+
+            outputs.append(y_nano.contiguous().view(B, T, -1))
+
+        # Concatenate all head outputs and project
+        y = torch.cat(outputs, dim=-1)
         y = self.c_proj(y)
         return y
 
@@ -172,8 +302,10 @@ class GPT(nn.Module):
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
-        head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
+        # For nanoheads, we need to calculate the total KV dimension properly
+        # Each layer can have different splits, but for simplicity we use the first layer's config
+        dummy_attn = CausalSelfAttention(config, 0)
+        kv_dim = dummy_attn.normal_kv_heads * dummy_attn.normal_head_dim + dummy_attn.nano_kv_heads * dummy_attn.nano_head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
@@ -209,9 +341,17 @@ class GPT(nn.Module):
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+            # Initialize normal head projections
+            if block.attn.normal_heads > 0:
+                torch.nn.init.uniform_(block.attn.c_q_normal.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_k_normal.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v_normal.weight, -s, s)
+            # Initialize nano head projections
+            if block.attn.has_nanoheads:
+                torch.nn.init.uniform_(block.attn.c_q_nano.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_k_nano.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v_nano.weight, -s, s)
+            # Output projection and MLP
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
