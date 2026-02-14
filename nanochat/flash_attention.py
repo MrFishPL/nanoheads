@@ -55,6 +55,32 @@ def _use_fa3():
     return HAS_FA3  # auto
 
 
+def _fa3_training_supported(q, k, v):
+    """
+    Conservative gate for FA3 kernels.
+    Falls back to SDPA for unusual head dimensions (e.g. nanoheads dim=2/3).
+    """
+    dq, dk, dv = q.shape[-1], k.shape[-1], v.shape[-1]
+    if dq != dk or dk != dv:
+        return False
+    # FA3 is most robust with head dims divisible by 8.
+    if dq % 8 != 0:
+        return False
+    return True
+
+
+def _fa3_kvcache_supported(q, k_cache, v_cache, k, v):
+    """Same conservative gate as _fa3_training_supported for KV-cache path."""
+    dq = q.shape[-1]
+    dk = k.shape[-1] if k is not None else k_cache.shape[-1]
+    dv = v.shape[-1] if v is not None else v_cache.shape[-1]
+    if dq != dk or dk != dv:
+        return False
+    if dq % 8 != 0:
+        return False
+    return True
+
+
 # =============================================================================
 # SDPA helpers
 # =============================================================================
@@ -108,7 +134,7 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     Returns:
         Output tensor of shape (B, T, H, D)
     """
-    if _use_fa3():
+    if _use_fa3() and _fa3_training_supported(q, k, v):
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
@@ -138,7 +164,7 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     Returns:
         Output tensor of shape (B, T_new, H, D)
     """
-    if _use_fa3():
+    if _use_fa3() and _fa3_kvcache_supported(q, k_cache, v_cache, k, v):
         return _fa3.flash_attn_with_kvcache(
             q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
             causal=causal, window_size=window_size

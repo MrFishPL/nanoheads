@@ -54,6 +54,8 @@ def has_ve(layer_idx, n_layer):
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4  # multihead attention
     d = x.shape[3] // 2
+    assert cos.shape[-1] == d and sin.shape[-1] == d, \
+        f"RoPE cache mismatch: x head_dim={x.shape[3]} expects cos/sin last dim {d}, got {cos.shape[-1]}/{sin.shape[-1]}"
     x1, x2 = x[..., :d], x[..., d:] # split up last dim into two halves
     y1 = x1 * cos + x2 * sin # rotate pairs of dims
     y2 = x1 * (-sin) + x2 * cos
@@ -84,7 +86,7 @@ def calculate_nanohead_split(n_embd, n_head, n_kv_head, head_dim, nanohead_propo
     # 3. nano_output_dim is a multiple of nanohead_dim
 
     best_config = None
-    best_diff = float('inf')
+    best_score = None
 
     # Try different nano_output_dims around the target
     # nano_dim must be a multiple of nanohead_dim
@@ -109,14 +111,24 @@ def calculate_nanohead_split(n_embd, n_head, n_kv_head, head_dim, nanohead_propo
         if nano_dim_candidate % nanohead_dim != 0:
             continue
 
-        # Find best even divisor for normal_dim_candidate (closest to target head_dim)
-        for candidate_head_dim in range(2, normal_dim_candidate + 1, 2):
-            if normal_dim_candidate % candidate_head_dim == 0:
-                diff = abs(nano_dim_candidate - target_nano_dim)
-                if diff < best_diff:
-                    best_diff = diff
-                    best_config = (normal_dim_candidate, candidate_head_dim, nano_dim_candidate)
-                break  # Take the first (smallest) even divisor
+        # Find even divisors for normal_dim_candidate and pick one that is:
+        # 1) close to the requested head_dim, 2) FA-friendly if possible (multiple of 8),
+        # 3) not pathologically tiny.
+        divisors = [
+            d for d in range(2, normal_dim_candidate + 1, 2)
+            if normal_dim_candidate % d == 0
+        ]
+        for candidate_head_dim in divisors:
+            score = (
+                0 if candidate_head_dim % 8 == 0 else 1,    # prefer FA-friendly dims
+                abs(nano_dim_candidate - target_nano_dim),  # then match requested proportion
+                abs(candidate_head_dim - head_dim),          # stay near baseline head dim
+                0 if candidate_head_dim >= 16 else 1,        # avoid very small head dims
+                -candidate_head_dim,                         # tie-breaker: prefer larger
+            )
+            if best_score is None or score < best_score:
+                best_score = score
+                best_config = (normal_dim_candidate, candidate_head_dim, nano_dim_candidate)
 
     assert best_config is not None, f"Could not find valid split for n_embd={n_embd}, proportion={nanohead_proportion}"
 
@@ -124,9 +136,13 @@ def calculate_nanohead_split(n_embd, n_head, n_kv_head, head_dim, nanohead_propo
 
     # Calculate number of heads
     normal_heads = normal_output_dim // normal_head_dim
-    normal_kv_heads = max(1, round(normal_heads / gqa_ratio))
+    def closest_divisor(n, target):
+        divisors = [d for d in range(1, n + 1) if n % d == 0]
+        return min(divisors, key=lambda d: (abs(d - target), -d))
+
+    normal_kv_heads = closest_divisor(normal_heads, max(1, round(normal_heads / gqa_ratio)))
     nano_heads = nano_output_dim // nanohead_dim
-    nano_kv_heads = max(1, round(nano_heads / gqa_ratio))
+    nano_kv_heads = closest_divisor(nano_heads, max(1, round(nano_heads / gqa_ratio)))
 
     # Verify the split
     actual_total = normal_heads * normal_head_dim + nano_heads * nanohead_dim
@@ -305,6 +321,8 @@ class GPT(nn.Module):
         # For nanoheads, we need to calculate the total KV dimension properly
         # Each layer can have different splits, but for simplicity we use the first layer's config
         dummy_attn = CausalSelfAttention(config, 0)
+        # RoPE is only applied to normal heads, so the rotary cache must match normal_head_dim.
+        self.rope_head_dim = dummy_attn.normal_head_dim
         kv_dim = dummy_attn.normal_kv_heads * dummy_attn.normal_head_dim + dummy_attn.nano_kv_heads * dummy_attn.nano_head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
@@ -312,8 +330,7 @@ class GPT(nn.Module):
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
         # In the future we can dynamically grow the cache, for now it's fine.
         self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
-        head_dim = config.n_embd // config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, self.rope_head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
@@ -370,8 +387,7 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
 
         # Rotary embeddings
-        head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, self.rope_head_dim)
         self.cos, self.sin = cos, sin
 
         # Cast embeddings to bf16: optimizer can tolerate it and it saves memory
