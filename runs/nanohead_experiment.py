@@ -81,7 +81,8 @@ def estimate_depth_for_target_params(target_params, aspect_ratio=64, vocab_size=
     return best_depth, final_params
 
 
-def run_training(depth, nanohead_proportion, nanohead_dim, wandb_run_name, target_param_data_ratio=10.5, device_batch_size=32):
+def run_training(depth, nanohead_proportion, nanohead_dim, wandb_run_name, target_param_data_ratio=10.5,
+                 device_batch_size=32, nproc_per_node=1):
     """
     Run a single training run with the specified configuration.
     Uses Chinchilla-optimal training duration based on target_param_data_ratio.
@@ -91,10 +92,21 @@ def run_training(depth, nanohead_proportion, nanohead_dim, wandb_run_name, targe
     print0(f"Starting training: proportion={nanohead_proportion}, depth={depth}, run={wandb_run_name}")
     print0(f"{'='*80}\n")
 
-    # Build the training command
-    # Let nanochat calculate optimal iterations based on Chinchilla laws
-    cmd = [
-        "python", "-m", "scripts.base_train",
+    # Build the training command.
+    # Let nanochat calculate optimal iterations based on Chinchilla laws.
+    # Use torchrun for multi-GPU execution when nproc_per_node > 1.
+    if nproc_per_node > 1:
+        cmd = [
+            "torchrun",
+            "--standalone",
+            f"--nproc_per_node={nproc_per_node}",
+            "-m", "scripts.base_train",
+            "--",  # stop torchrun arg parsing; remaining args go to scripts.base_train
+        ]
+    else:
+        cmd = ["python", "-m", "scripts.base_train"]
+
+    cmd += [
         "--depth", str(depth),
         "--nanohead-proportion", str(nanohead_proportion),
         "--nanohead-dim", str(nanohead_dim),
@@ -106,6 +118,8 @@ def run_training(depth, nanohead_proportion, nanohead_dim, wandb_run_name, targe
         "--sample-every", "-1",  # Disable sampling
         "--save-every", "-1",  # Don't save intermediate checkpoints
     ]
+
+    print0(f"Launch command: {' '.join(cmd)}")
 
     # Run the training
     result = subprocess.run(cmd, capture_output=False, text=True)
@@ -209,6 +223,9 @@ def main():
                         help="Data-to-parameter ratio for compute-optimal training (Chinchilla=20, default: 10.5)")
     parser.add_argument("--device-batch-size", type=int, default=32,
                         help="Per-device batch size (default: 32, reduce if OOM)")
+    parser.add_argument("--nproc-per-node", type=int, default=-1,
+                        help="Number of GPU processes per training run "
+                             "(-1 = auto-detect CUDA device count, min 1)")
     args = parser.parse_args()
 
     # Configuration
@@ -217,6 +234,12 @@ def main():
     proportions = [float(p.strip()) for p in args.proportions.split(',')]
     target_param_data_ratio = args.target_param_data_ratio
     device_batch_size = args.device_batch_size
+
+    if args.nproc_per_node == -1:
+        nproc_per_node = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        nproc_per_node = max(1, nproc_per_node)
+    else:
+        nproc_per_node = max(1, args.nproc_per_node)
 
     # Estimate depth for the baseline (no nanoheads)
     depth, actual_params = estimate_depth_for_target_params(
@@ -232,6 +255,7 @@ def main():
     print0(f"  Nanohead dimension: {nanohead_dim}")
     print0(f"  Proportions to test: {proportions}")
     print0(f"  Target param-data ratio: {target_param_data_ratio} (Chinchilla=20)")
+    print0(f"  nproc_per_node (GPUs per run): {nproc_per_node}")
     print0(f"  Training will use compute-optimal iterations based on model size")
     print0(f"\n")
 
@@ -264,7 +288,8 @@ def main():
             nanohead_dim=nanohead_dim,
             wandb_run_name=run_name,
             target_param_data_ratio=target_param_data_ratio,
-            device_batch_size=device_batch_size
+            device_batch_size=device_batch_size,
+            nproc_per_node=nproc_per_node,
         )
 
     print0("\n" + "="*80)

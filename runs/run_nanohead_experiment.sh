@@ -12,6 +12,7 @@
 #   --proportions "..."         Comma-separated proportions (default: "0.0,0.2,0.4,0.6,0.8")
 #   --target-param-data-ratio N Data:param ratio for training duration (default: 10.5, Chinchilla=20)
 #   --device-batch-size N       Per-device batch size (default: 32, reduce if OOM)
+#   --nproc-per-node N          GPUs per training run (-1 = auto-detect, default)
 #
 # Examples:
 #   bash runs/run_nanohead_experiment.sh --target-params 100
@@ -19,6 +20,7 @@
 #   bash runs/run_nanohead_experiment.sh --proportions "0.0,0.3,0.5"
 #   bash runs/run_nanohead_experiment.sh --target-params 500 --target-param-data-ratio 20
 #   bash runs/run_nanohead_experiment.sh --target-params 500 --device-batch-size 16
+#   bash runs/run_nanohead_experiment.sh --target-params 100 --proportions "0.0,0.8" --nproc-per-node 2
 
 set -e  # Exit on error
 
