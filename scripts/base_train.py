@@ -132,8 +132,10 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-def build_model_meta(depth):
+def build_model_meta(depth, nanohead_ablation=None):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
+    if nanohead_ablation is None:
+        nanohead_ablation = args.nanohead_ablation
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
@@ -145,7 +147,7 @@ def build_model_meta(depth):
         window_pattern=args.window_pattern,
         nanohead_proportion=args.nanohead_proportion,
         nanohead_dim=args.nanohead_dim,
-        nanohead_ablation=args.nanohead_ablation,
+        nanohead_ablation=nanohead_ablation,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -271,11 +273,21 @@ def get_scaling_params(m):
     params_counts = m.num_scaling_params()
     scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
     return scaling_params
-num_scaling_params = get_scaling_params(model)
+
+# In classic-only ablation mode, lock scaling-law schedule to the original
+# non-ablation nanohead architecture for the same depth/proportion.
+scale_with_non_ablation = args.nanohead_ablation and args.nanohead_proportion > 0
+if scale_with_non_ablation:
+    print0("Nanohead ablation mode: using non-ablation nanohead config for scaling-law schedule (matches original runs).")
+    scaling_model = build_model_meta(args.depth, nanohead_ablation=False)
+else:
+    scaling_model = model
+
+num_scaling_params = get_scaling_params(scaling_model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
-d12_ref = build_model_meta(12) # creates the model on meta device
+d12_ref = build_model_meta(12, nanohead_ablation=False if scale_with_non_ablation else None) # creates the model on meta device
 D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
 B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
 
