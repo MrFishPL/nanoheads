@@ -82,7 +82,7 @@ def estimate_depth_for_target_params(target_params, aspect_ratio=64, vocab_size=
 
 
 def run_training(depth, nanohead_proportion, nanohead_dim, wandb_run_name, target_param_data_ratio=10.5,
-                 device_batch_size=32, nproc_per_node=1):
+                 device_batch_size=32, nproc_per_node=1, model_tag=None, nanohead_ablation=False):
     """
     Run a single training run with the specified configuration.
     Uses Chinchilla-optimal training duration based on target_param_data_ratio.
@@ -118,6 +118,10 @@ def run_training(depth, nanohead_proportion, nanohead_dim, wandb_run_name, targe
         "--sample-every", "-1",  # Disable sampling
         "--save-every", "-1",  # Don't save intermediate checkpoints
     ]
+    if model_tag is not None:
+        cmd += ["--model-tag", str(model_tag)]
+    if nanohead_ablation:
+        cmd += ["--nanohead-ablation"]
 
     print0(f"Launch command: {' '.join(cmd)}")
 
@@ -226,6 +230,8 @@ def main():
     parser.add_argument("--nproc-per-node", type=int, default=-1,
                         help="Number of GPU processes per training run "
                              "(-1 = auto-detect CUDA device count, min 1)")
+    parser.add_argument("--ablation-classic-only", action="store_true",
+                        help="run classic-only ablations: keep classic split implied by each proportion, disable nanoheads")
     args = parser.parse_args()
 
     # Configuration
@@ -254,6 +260,7 @@ def main():
     print0(f"  Depth: {depth}")
     print0(f"  Nanohead dimension: {nanohead_dim}")
     print0(f"  Proportions to test: {proportions}")
+    print0(f"  Ablation classic-only mode: {args.ablation_classic_only}")
     print0(f"  Target param-data ratio: {target_param_data_ratio} (Chinchilla=20)")
     print0(f"  nproc_per_node (GPUs per run): {nproc_per_node}")
     print0(f"  Training will use compute-optimal iterations based on model size")
@@ -271,6 +278,10 @@ def main():
     run_names = {}
 
     for proportion in proportions:
+        if args.ablation_classic_only and proportion == 0.0:
+            print0("Skipping p=0.0 in ablation mode (duplicate baseline).")
+            continue
+
         # Re-estimate depth for this proportion to keep params roughly constant
         # (nanoheads have fewer params, so we might need slightly different depth)
         depth_adj, params_adj = estimate_depth_for_target_params(
@@ -279,7 +290,12 @@ def main():
             nanohead_dim=nanohead_dim
         )
 
-        run_name = f"nanohead_p{int(proportion*100):02d}_d{depth_adj}"
+        if args.ablation_classic_only:
+            run_name = f"nanoabl_p{int(proportion*100):02d}_d{depth_adj}"
+            model_tag = run_name
+        else:
+            run_name = f"nanohead_p{int(proportion*100):02d}_d{depth_adj}"
+            model_tag = None
         run_names[proportion] = run_name
 
         run_training(
@@ -290,6 +306,8 @@ def main():
             target_param_data_ratio=target_param_data_ratio,
             device_batch_size=device_batch_size,
             nproc_per_node=nproc_per_node,
+            model_tag=model_tag,
+            nanohead_ablation=args.ablation_classic_only,
         )
 
     print0("\n" + "="*80)

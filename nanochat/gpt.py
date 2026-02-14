@@ -40,6 +40,9 @@ class GPTConfig:
     # Nanohead configuration
     nanohead_proportion: float = 0.0  # proportion of attention QKV params for nanoheads (0 = disabled)
     nanohead_dim: int = 3  # dimension of each nanohead
+    # Classic-only ablation for nanoheads:
+    # keep the classic head split implied by nanohead_proportion, but disable nanoheads.
+    nanohead_ablation: bool = False
 
 
 def norm(x):
@@ -167,6 +170,11 @@ class CausalSelfAttention(nn.Module):
             config.nanohead_proportion, config.nanohead_dim
         )
 
+        # Classic-only ablation: keep the split-implied normal branch, but disable nanoheads.
+        if config.nanohead_ablation and config.nanohead_proportion > 0:
+            self.nano_heads = 0
+            self.nano_kv_heads = 0
+
         self.has_nanoheads = self.nano_heads > 0
 
         # Normal head projections
@@ -181,8 +189,10 @@ class CausalSelfAttention(nn.Module):
             self.c_k_nano = nn.Linear(self.n_embd, self.nano_kv_heads * self.nano_head_dim, bias=False)
             self.c_v_nano = nn.Linear(self.n_embd, self.nano_kv_heads * self.nano_head_dim, bias=False)
 
-        # Output projection (same for all heads)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        # Output projection input follows the effective concatenated attention width.
+        self.attn_out_dim = self.normal_heads * self.normal_head_dim + self.nano_heads * self.nano_head_dim
+        assert self.attn_out_dim > 0, "Attention output width must be positive"
+        self.c_proj = nn.Linear(self.attn_out_dim, self.n_embd, bias=False)
 
         # Value embeddings
         self.ve_gate_channels = 32
